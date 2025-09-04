@@ -20,7 +20,7 @@ function removeFile(FilePath) {
 
 router.get("/", async (req, res) => {
   let num = req.query.number;
-  async function AlphanPair() {
+  async function AlphaPair() {
     const { state, saveCreds } = await useMultiFileAuthState(`./session`);
     try {
       let AlphaPairWeb = makeWASocket({
@@ -129,5 +129,6 @@ process.on("uncaughtException", function (err) {
 });
 
 module.exports = router;
+
 
 
