@@ -47,7 +47,9 @@ router.get("/", async (req, res) => {
   let num = String(numRaw).replace(/[^0-9]/g, "");
   if (!num) return res.status(400).json({ error: "Invalid phone number" });
 
-  // AlphaPair with retry count
+  console.log(`Pairing request for number: ${num}`);
+
+  // AlphaPair with improved connection handling
   async function AlphaPair(retryCount = 0) {
     if (retryCount > MAX_RETRIES) {
       console.error("Max retries reached for AlphaPair");
@@ -56,7 +58,9 @@ router.get("/", async (req, res) => {
     }
 
     try {
+      console.log("Creating auth state...");
       const { state, saveCreds } = await useMultiFileAuthState(`./session`);
+      console.log("Auth state created successfully");
 
       const AlphaPairWeb = makeWASocket({
         auth: {
@@ -68,126 +72,33 @@ router.get("/", async (req, res) => {
         browser: Browsers.macOS("Safari"),
       });
 
-      // If the session is not registered, request pairing code
-      if (!AlphaPairWeb.authState?.creds?.registered) {
-        try {
-          const code = await AlphaPairWeb.requestPairingCode(num);
-          if (!res.headersSent) {
-            return res.status(200).json({ pairingCode: code });
-          }
-        } catch (err) {
-          console.error("requestPairingCode failed:", err);
-          if (!res.headersSent) return res.status(500).json({ error: "Failed to request pairing code" });
-        }
-      }
+      console.log("Socket created, setting up event handlers...");
 
-      // keep creds updated
-      AlphaPairWeb.ev.on("creds.update", saveCreds);
-
+      // Set up connection event handler first
       AlphaPairWeb.ev.on("connection.update", async (update) => {
-        const { connection, lastDisconnect } = update;
-        console.log("connection.update ->", connection);
+        const { connection, lastDisconnect, qr } = update;
+        console.log("Connection update:", connection);
 
         if (connection === "open") {
-          try {
-            // small wait to ensure session files are flushed
-            await delay(3000);
-
-            const authPath = path.resolve("./session");
-            const credsFile = path.join(authPath, "creds.json");
-
-            if (!fs.existsSync(credsFile)) {
-              console.error("creds.json not found after connection open");
-              // respond to HTTP caller if still waiting
-              if (!res.headersSent) return res.status(500).json({ error: "creds.json not found" });
-              return;
-            }
-
-            const user_jid = jidNormalizedUser(AlphaPairWeb.user?.id || "");
-            if (!user_jid) {
-              console.error("user_jid not available");
-              if (!res.headersSent) return res.status(500).json({ error: "user id not available" });
-              return;
-            }
-
-            // create a safer filename and upload
-            function randomMegaId(length = 6, numberLength = 4) {
-              const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-              let result = "";
-              for (let i = 0; i < length; i++) result += characters.charAt(Math.floor(Math.random() * characters.length));
-              const number = Math.floor(Math.random() * Math.pow(10, numberLength));
-              return `${result}${number}`;
-            }
-
-            let mega_url;
-            try {
-              mega_url = await upload(fs.createReadStream(credsFile), `${randomMegaId()}.json`);
-            } catch (e) {
-              console.error("Mega upload failed:", e);
-              // Do not expose raw creds if upload fails; notify caller
-              if (!res.headersSent) return res.status(500).json({ error: "Failed to upload creds" });
-              // continue without exiting
-              return;
-            }
-
-            const string_session = mega_url.replace("https://mega.nz/file/", "");
-
-            const sid = `*ALPHA [The powerful WA BOT]*\n\n👉 ${string_session} 👈\n\n*This is your Session ID. Copy this ID and paste into config.js file.*\n\n*You can ask any question using this link:*\n\n*wa.me/message/0722737727*`;
-
-            const mg = `🛑 Do not share this code with anyone. Keep it private. 🛑`;
-
-            // Make sure image URL is valid (replace with your own hosted image)
-            const imageUrl = process.env.SESSION_IMAGE_URL || "https://i.imgur.com/yourimage.png";
-
-            // send messages to the user (catch errors individually)
-            try {
-              await AlphaPairWeb.sendMessage(user_jid, { image: { url: imageUrl }, caption: sid });
-            } catch (e) {
-              console.error("sendMessage(image) failed:", e);
-            }
-
-            try {
-              await AlphaPairWeb.sendMessage(user_jid, { text: string_session });
-            } catch (e) {
-              console.error("sendMessage(text session) failed:", e);
-            }
-
-            try {
-              await AlphaPairWeb.sendMessage(user_jid, { text: mg });
-            } catch (e) {
-              console.error("sendMessage(mg) failed:", e);
-            }
-
-            // Remove session folder (optional). If you want to keep it, comment this out.
-            try {
-              removeFileSync(authPath);
-              console.log("Session folder removed");
-            } catch (e) {
-              console.error("Failed to remove session:", e);
-            }
-
-            // respond to HTTP caller if still waiting
-            if (!res.headersSent) return res.status(200).json({ ok: true, sessionLink: string_session });
-
-            // note: do NOT call process.exit in a request handler on production web servers.
-            // If you want pm2 to restart, call safePm2Restart and let pm2 manage restarts.
-            // safePm2Restart();
-          } catch (e) {
-            console.error("Error in connection.open handler:", e);
-            safePm2Restart();
-            removeFileSync("./session");
-            if (!res.headersSent) return res.status(500).json({ error: "Internal server error" });
+          console.log("Connection opened successfully");
+          
+          // Check if already registered
+          if (AlphaPairWeb.authState?.creds?.registered) {
+            console.log("Already registered, proceeding with session handling...");
+            // Handle existing session...
+            handleExistingSession(AlphaPairWeb, res);
           }
         } else if (connection === "close") {
-          // only retry on non-auth failures
           const statusCode = lastDisconnect?.error?.output?.statusCode;
+          console.log("Connection closed, status code:", statusCode);
+          
           if (statusCode && statusCode === 401) {
             console.error("Auth failure (401). Not retrying");
             if (!res.headersSent) return res.status(401).json({ error: "Authentication failure" });
             return;
           }
 
-          // schedule a retry with backoff
+          // Retry connection
           const nextRetry = retryCount + 1;
           if (nextRetry <= MAX_RETRIES) {
             const delayMs = 5000 * nextRetry;
@@ -199,22 +110,100 @@ router.get("/", async (req, res) => {
           }
         }
       });
+
+      // Keep creds updated
+      AlphaPairWeb.ev.on("creds.update", saveCreds);
+
+      // Check if we need pairing code (not registered)
+      if (!AlphaPairWeb.authState?.creds?.registered) {
+        console.log("Not registered, waiting for connection before requesting pairing code...");
+        
+        // Wait for connection to be established
+        const waitForConnection = new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(new Error("Connection timeout"));
+          }, 30000); // 30 second timeout
+
+          const checkConnection = () => {
+            if (AlphaPairWeb.user || AlphaPairWeb.authState?.creds?.registered) {
+              clearTimeout(timeout);
+              resolve();
+            } else {
+              setTimeout(checkConnection, 100);
+            }
+          };
+          
+          checkConnection();
+        });
+
+        try {
+          // Wait a moment for socket to initialize
+          await delay(2000);
+          console.log("Requesting pairing code...");
+          
+          const code = await AlphaPairWeb.requestPairingCode(num);
+          console.log("Pairing code generated:", code);
+          
+          if (!res.headersSent) {
+            return res.status(200).json({ code: code });
+          }
+        } catch (err) {
+          console.error("requestPairingCode failed:", err.message || err);
+          if (!res.headersSent) return res.status(500).json({ error: "Failed to request pairing code: " + (err.message || err) });
+        }
+      }
+
     } catch (err) {
       console.error("AlphaPair outer error:", err);
-      // attempt safe restart and cleanup, but avoid tight recursion
       safePm2Restart();
       removeFileSync("./session");
       if (!res.headersSent) return res.status(503).json({ error: "Service Unavailable" });
     }
   }
 
-  // start pairing process
-  return AlphaPair();
-});
+  async function handleExistingSession(socket, res) {
+    try {
+      await delay(3000);
 
-process.on("uncaughtException", function (err) {
-  console.error("Caught exception: ", err);
-  safePm2Restart();
-});
+      const authPath = path.resolve("./session");
+      const credsFile = path.join(authPath, "creds.json");
 
-module.exports = router;
+      if (!fs.existsSync(credsFile)) {
+        console.error("creds.json not found after connection open");
+        if (!res.headersSent) return res.status(500).json({ error: "creds.json not found" });
+        return;
+      }
+
+      const user_jid = jidNormalizedUser(socket.user?.id || "");
+      if (!user_jid) {
+        console.error("user_jid not available");
+        if (!res.headersSent) return res.status(500).json({ error: "user id not available" });
+        return;
+      }
+
+      // Create a safer filename and upload
+      function randomMegaId(length = 6, numberLength = 4) {
+        const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let result = "";
+        for (let i = 0; i < length; i++) result += characters.charAt(Math.floor(Math.random() * characters.length));
+        const number = Math.floor(Math.random() * Math.pow(10, numberLength));
+        return `${result}${number}`;
+      }
+
+      let mega_url;
+      try {
+        mega_url = await upload(fs.createReadStream(credsFile), `${randomMegaId()}.json`);
+      } catch (e) {
+        console.error("Mega upload failed:", e);
+        if (!res.headersSent) return res.status(500).json({ error: "Failed to upload creds" });
+        return;
+      }
+
+      const string_session = mega_url.replace("https://mega.nz/file/", "");
+      const sid = `*ALPHA [The powerful WA BOT]*\n\n👉 ${string_session} 👈\n\n*This is your Session ID. Copy this ID and paste into config.js file.*\n\n*You can ask any question using this link:*\n\n*wa.me/message/0722737727*`;
+      const mg = `🛑 Do not share this code with anyone. Keep it private. 🛑`;
+
+      // Send messages to the user
+      try {
+        await socket.sendMessage(user_jid, { text: sid });
+        await socket.sendMessage(user_jid, { text: string_session });
